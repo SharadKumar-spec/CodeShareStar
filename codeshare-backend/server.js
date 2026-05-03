@@ -1,0 +1,410 @@
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const { nanoid } = require('nanoid');
+const mongoose = require('mongoose');
+
+// ── Routes & Middleware ───────────────────────────────────────────────────────
+const authRouter = require('./routes/auth');
+const { optionalToken, checkPlanLimits, PLAN_LIMITS } = require('./middleware/auth');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ── MongoDB connection with Memory Server Fallback ────────────────────────────
+async function connectDB() {
+  const uri = process.env.MONGO_URI || 'mongodb://localhost:27017/codeshare';
+  try {
+    // Try connecting to the provided URI first
+    await mongoose.connect(uri, { serverSelectionTimeoutMS: 5000 });
+    console.log('✅ Connected to MongoDB at', uri);
+  } catch (err) {
+    console.warn('⚠️ Local MongoDB not found. Starting MongoMemoryServer...');
+    try {
+      const { MongoMemoryServer } = require('mongodb-memory-server');
+      const mongod = await MongoMemoryServer.create();
+      const memoryUri = mongod.getUri();
+      await mongoose.connect(memoryUri);
+      console.log('🚀 MongoMemoryServer started! Data will be lost on restart.');
+      console.log('📍 Connection String:', memoryUri);
+      
+      // Seed a default user for testing in memory mode
+      const User = require('./models/User');
+      const bcrypt = require('bcryptjs');
+      const hash = await bcrypt.hash('password123', 12);
+      await User.create({
+        email: 'sharadgupta6393@gmail.com',
+        username: 'Sharad',
+        passwordHash: hash,
+        plan: 'PREMIUM',
+        planSelectedAt: new Date(),
+        codeshareCount: 5
+      });
+      console.log('✅ Seeded mock user: sharadgupta6393@gmail.com / password123');
+    } catch (memErr) {
+      console.error('❌ Failed to start MongoMemoryServer:', memErr.message);
+    }
+  }
+}
+
+connectDB();
+
+// ── Auth routes ───────────────────────────────────────────────────────────────
+app.use('/api/auth', authRouter);
+
+// ── Code Execution (Local child_process) ─────────────────────────────────────
+const { spawn } = require('child_process');
+const os = require('os');
+const path = require('path');
+const fs = require('fs');
+
+const NON_EXECUTABLE = ['html', 'css', 'sql', 'json', 'markdown'];
+
+// Write code to a temp file, run command, return { stdout, stderr }
+function runInSandbox(cmd, args, input, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    let stdout = '', stderr = '', done = false;
+    // On Windows, npx/javac might require shell: true, but node/python don't.
+    // We'll use shell: true but we know we're not passing unsanitized user input in args directly as flags (only file paths).
+    const child = spawn(cmd, args, { timeout: timeoutMs, shell: process.platform === 'win32' });
+    if (input) { child.stdin.write(input); child.stdin.end(); }
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('close', (code) => {
+      if (done) return; done = true;
+      resolve({ stdout, stderr, code });
+    });
+    child.on('error', (e) => {
+      if (done) return; done = true;
+      resolve({ stdout, stderr: e.message, code: 1 });
+    });
+    setTimeout(() => {
+      if (done) return; done = true;
+      try { child.kill(); } catch {}
+      resolve({ stdout, stderr: '⏰ Execution timed out (12s limit).', code: 124 });
+    }, timeoutMs);
+  });
+}
+
+function tmpFile(ext) {
+  return path.join(os.tmpdir(), `cs_run_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
+}
+
+async function executeCode(language, code) {
+  let file, result;
+  switch (language) {
+    case 'javascript': {
+      file = tmpFile('.js');
+      fs.writeFileSync(file, code);
+      result = await runInSandbox('node', [file]);
+      break;
+    }
+    case 'typescript': {
+      file = tmpFile('.ts');
+      fs.writeFileSync(file, code);
+      // Try ts-node, fallback to compiling with tsc then running
+      result = await runInSandbox('npx', ['--yes', 'ts-node', '--skipProject', file]);
+      break;
+    }
+    case 'python': {
+      file = tmpFile('.py');
+      fs.writeFileSync(file, code);
+      // Try python3 then python
+      result = await runInSandbox('python', [file]);
+      if (result.stderr && result.stderr.includes('is not recognized')) {
+        result = await runInSandbox('python3', [file]);
+      }
+      break;
+    }
+    case 'java': {
+      // Java needs class name = file name
+      const className = (code.match(/public\s+class\s+(\w+)/) || [])[1] || 'Main';
+      const dir = path.join(os.tmpdir(), `cs_java_${Date.now()}`);
+      fs.mkdirSync(dir, { recursive: true });
+      file = path.join(dir, `${className}.java`);
+      fs.writeFileSync(file, code);
+      const compile = await runInSandbox('javac', [file]);
+      if (compile.code !== 0) {
+        result = { stdout: '', stderr: compile.stderr || compile.stdout };
+      } else {
+        result = await runInSandbox('java', ['-cp', dir, className]);
+      }
+      try { fs.rmSync(dir, { recursive: true }); } catch {}
+      break;
+    }
+    case 'cpp': {
+      file = tmpFile('.cpp');
+      const outFile = tmpFile('.exe');
+      fs.writeFileSync(file, code);
+      const compile = await runInSandbox('g++', [file, '-o', outFile, '-std=c++17']);
+      if (compile.code !== 0) {
+        result = { stdout: '', stderr: compile.stderr || compile.stdout };
+      } else {
+        result = await runInSandbox(outFile, []);
+      }
+      try { fs.unlinkSync(outFile); } catch {}
+      break;
+    }
+    case 'csharp': {
+      // Use dotnet-script or csc
+      file = tmpFile('.cs');
+      fs.writeFileSync(file, code);
+      result = await runInSandbox('dotnet-script', [file]);
+      if (result.stderr && result.stderr.includes('is not recognized')) {
+        result = { stdout: '', stderr: '⚠️ C# requires dotnet-script.\nInstall: npm install -g dotnet-script' };
+      }
+      break;
+    }
+    case 'go': {
+      file = tmpFile('.go');
+      fs.writeFileSync(file, code);
+      result = await runInSandbox('go', ['run', file]);
+      break;
+    }
+    case 'rust': {
+      file = tmpFile('.rs');
+      const outFile = tmpFile('');
+      fs.writeFileSync(file, code);
+      const compile = await runInSandbox('rustc', [file, '-o', outFile]);
+      if (compile.code !== 0) {
+        result = { stdout: '', stderr: compile.stderr || compile.stdout };
+      } else {
+        result = await runInSandbox(outFile, []);
+      }
+      try { fs.unlinkSync(outFile); } catch {}
+      break;
+    }
+    default:
+      return { output: `⚠️ "${language}" cannot be executed here.`, error: false };
+  }
+  // Cleanup temp file
+  if (file) { try { fs.unlinkSync(file); } catch {} }
+  const stdout = result.stdout || '';
+  const stderr = result.stderr || '';
+  const hasError = !!stderr && result.code !== 0;
+  const output = stdout + (stderr ? (stdout ? '\n' : '') + '⚠️ ' + stderr : '');
+  return { output: output.trim() || '(No output)', error: hasError };
+}
+
+app.post('/api/run', async (req, res) => {
+  const { language, code } = req.body;
+  if (!language || !code) return res.status(400).json({ output: 'Missing language or code.', error: true });
+  if (NON_EXECUTABLE.includes(language)) {
+    const names = { html: 'HTML', css: 'CSS', sql: 'SQL', json: 'JSON', markdown: 'Markdown' };
+    return res.json({
+      output: `ℹ️ ${names[language] || language} is a markup/data language — it cannot be "run".\n\nSwitch to JavaScript, Python, Java, C++, C#, Go, Rust, or TypeScript to execute code.`,
+      error: false,
+    });
+  }
+  try {
+    console.log(`[RUN] ${language} (${code.length} chars)`);
+    const result = await executeCode(language, code);
+    console.log(`[RUN] done — error=${result.error}`);
+    res.json(result);
+  } catch (err) {
+    console.error('[RUN] Unexpected error:', err);
+    res.json({ output: '❌ Server error: ' + err.message, error: true });
+  }
+});
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+});
+
+// ── In-memory room store ──────────────────────────────────────────────────────
+const rooms = {};
+
+const USER_COLORS = [
+  '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4',
+  '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F',
+  '#BB8FCE', '#85C1E9',
+];
+
+function getRoom(roomId) {
+  if (!rooms[roomId]) {
+    rooms[roomId] = {
+      code: '// Start coding here...\n',
+      language: 'javascript',
+      users: {},
+      chat: [],
+      viewOnlyMode: false,
+    };
+  }
+  return rooms[roomId];
+}
+
+// ── REST: Create a room ───────────────────────────────────────────────────────
+app.post('/api/rooms', optionalToken, checkPlanLimits, async (req, res) => {
+  const roomId = nanoid(8);
+  const room = getRoom(roomId);
+
+  const ownerToken = nanoid(16);
+  room.ownerToken = ownerToken;
+  room.ownerId = req.userId || null;
+
+  if (req.dbUser) {
+    try {
+      req.dbUser.codeshareCount += 1;
+      await req.dbUser.save();
+    } catch (e) {
+      console.warn('Could not increment codeshare count:', e.message);
+    }
+  }
+
+  res.json({ roomId, plan: req.userPlan || 'GUEST', ownerToken });
+});
+
+// ── REST: Get room info ───────────────────────────────────────────────────────
+app.get('/api/rooms/:roomId', (req, res) => {
+  const { roomId } = req.params;
+  if (rooms[roomId]) {
+    const room = rooms[roomId];
+    res.json({
+      exists: true,
+      userCount: Object.keys(room.users).length,
+      language: room.language,
+      viewOnlyMode: room.viewOnlyMode,
+    });
+  } else {
+    res.json({ exists: false });
+  }
+});
+
+// ── REST: Toggle view-only mode (PRO/PREMIUM only) ────────────────────────────
+app.post('/api/rooms/:roomId/view-only', optionalToken, async (req, res) => {
+  const { roomId } = req.params;
+  const { enabled, ownerToken } = req.body;
+
+  if (!rooms[roomId]) return res.status(404).json({ error: 'Room not found' });
+  const room = rooms[roomId];
+
+  if (!req.userId) return res.status(403).json({ error: 'Login required', code: 'AUTH_REQUIRED' });
+
+  const isOwner = (ownerToken && room.ownerToken === ownerToken) || (req.userId && room.ownerId === req.userId);
+  if (!isOwner) return res.status(403).json({ error: 'Only the room creator can toggle view mode', code: 'NOT_OWNER' });
+
+  const User = require('./models/User');
+  const user = await User.findById(req.userId);
+  if (!user || !['PRO', 'PREMIUM'].includes(user.plan)) {
+    return res.status(403).json({ error: 'PRO or PREMIUM plan required', code: 'PLAN_REQUIRED' });
+  }
+
+  rooms[roomId].viewOnlyMode = !!enabled;
+  io.to(roomId).emit('view-only-update', { enabled: rooms[roomId].viewOnlyMode });
+  res.json({ viewOnlyMode: rooms[roomId].viewOnlyMode });
+});
+
+// ── Socket.IO ─────────────────────────────────────────────────────────────────
+io.on('connection', (socket) => {
+  console.log(`[+] Socket connected: ${socket.id}`);
+
+  socket.on('join-room', ({ roomId, username, plan = 'GUEST', ownerToken }) => {
+    const room = getRoom(roomId);
+
+    const currentCount = Object.keys(room.users).length;
+    const limit = PLAN_LIMITS[plan] || PLAN_LIMITS['GUEST'];
+
+    if (limit.maxCollaborators !== Infinity && currentCount >= limit.maxCollaborators) {
+      socket.emit('collab-limit-reached', {
+        plan,
+        limit: limit.maxCollaborators,
+        message: `This room is full for your plan (${plan}: max ${limit.maxCollaborators} users). Upgrade for unlimited collaborators.`,
+      });
+    }
+
+    const colorIndex = currentCount % USER_COLORS.length;
+    const color = USER_COLORS[colorIndex];
+
+    room.users[socket.id] = { name: username || 'Anonymous', color, plan };
+    socket.join(roomId);
+    socket.roomId = roomId;
+    socket.userPlan = plan;
+
+    const isOwner = !!(ownerToken && room.ownerToken === ownerToken);
+    socket.emit('init-code', {
+      code: room.code,
+      language: room.language,
+      viewOnlyMode: room.viewOnlyMode,
+      isOwner,
+    });
+
+    const userList = Object.values(room.users);
+    io.to(roomId).emit('users-update', userList);
+
+    socket.to(roomId).emit('user-joined', { name: room.users[socket.id].name, color });
+    socket.emit('chat-history', room.chat);
+
+    socket.isOwner = isOwner;
+
+    console.log(`  User "${room.users[socket.id].name}" [${plan}] joined room ${roomId}. Total: ${userList.length}`);
+  });
+
+  socket.on('code-change', ({ roomId, code }) => {
+    if (!rooms[roomId]) return;
+    if (rooms[roomId].viewOnlyMode && !socket.isOwner) return;
+    rooms[roomId].code = code;
+    socket.to(roomId).emit('code-update', { code });
+  });
+
+  socket.on('language-change', ({ roomId, language }) => {
+    if (!rooms[roomId]) return;
+    if (rooms[roomId].viewOnlyMode && !socket.isOwner) return;
+    rooms[roomId].language = language;
+    io.to(roomId).emit('language-update', { language });
+  });
+
+  socket.on('chat-message', ({ roomId, message }) => {
+    if (!rooms[roomId]) return;
+    const room = rooms[roomId];
+    const sender = room.users[socket.id];
+    if (!sender) return;
+
+    const msg = {
+      id: nanoid(6),
+      name: sender.name,
+      color: sender.color,
+      text: message,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+
+    room.chat.push(msg);
+    if (room.chat.length > 100) room.chat.shift();
+    io.to(roomId).emit('chat-message', msg);
+  });
+
+  socket.on('disconnect', () => {
+    const roomId = socket.roomId;
+    if (roomId && rooms[roomId]) {
+      const room = rooms[roomId];
+      const user = room.users[socket.id];
+      delete room.users[socket.id];
+
+      const userList = Object.values(room.users);
+      io.to(roomId).emit('users-update', userList);
+
+      if (user) {
+        socket.to(roomId).emit('user-left', { name: user.name });
+        console.log(`  User "${user.name}" left room ${roomId}. Total: ${userList.length}`);
+      }
+
+      if (userList.length === 0) {
+        setTimeout(() => {
+          if (rooms[roomId] && Object.keys(rooms[roomId].users).length === 0) {
+            delete rooms[roomId];
+            console.log(`  Room ${roomId} cleaned up (empty).`);
+          }
+        }, 10 * 60 * 1000);
+      }
+    }
+    console.log(`[-] Socket disconnected: ${socket.id}`);
+  });
+});
+
+const PORT = process.env.PORT || 4000;
+server.listen(PORT, () => {
+  console.log(`\n🚀 CodeShare backend running on http://localhost:${PORT}\n`);
+});
