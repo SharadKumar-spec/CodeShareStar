@@ -65,7 +65,7 @@ export default function HomePage() {
         navigate(`/room/${data.roomId}`)
       }
     } catch {
-      setError('Could not connect to server. Please check if the backend is running.')
+      setError('Could not connect to server. Please run the START_PROJECT.bat file.')
     } finally { setCreating(false) }
   }
 
@@ -112,7 +112,7 @@ export default function HomePage() {
       }
       navigate(`/room/${roomId}`)
     } catch {
-      setError('Could not reach the server. Please check your connection.')
+      setError('Could not reach the server. Make sure the backend is running.')
     } finally { setCreating(false) }
   }
 
