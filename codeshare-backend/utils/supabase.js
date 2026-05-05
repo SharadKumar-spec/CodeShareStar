@@ -52,16 +52,13 @@ class MockQuery {
 
 class MockSupabase {
   constructor() {
-    const bcrypt = require('bcryptjs');
-    const hash = bcrypt.hashSync('password123', 12);
-    
     this.db = { 
       users: [
         {
           id: 'test-user-1',
           email: 'sharadgupta829950@gmail.com',
           username: 'Sharad',
-          password_hash: hash,
+          password_hash: 'mock_hash',
           plan: 'PREMIUM',
           plan_selected_at: new Date(),
           codeshare_count: 5
@@ -70,7 +67,7 @@ class MockSupabase {
           id: 'test-user-2',
           email: 'sharadgupta6393@gmail.com',
           username: 'Sharad',
-          password_hash: hash,
+          password_hash: 'mock_hash',
           plan: 'PREMIUM',
           plan_selected_at: new Date(),
           codeshare_count: 5

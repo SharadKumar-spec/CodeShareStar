@@ -1,6 +1,30 @@
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Dependency directories
 node_modules/
+codeshare-backend/node_modules/
+codeshare-frontend/node_modules/
+
+# Environment variables
 .env
-.DS_Store
+codeshare-backend/.env
+codeshare-frontend/.env
+
+# Build outputs
 dist/
 build/
-*.log
+codeshare-frontend/dist/
+
+# IDE / OS files
+.DS_Store
+.vscode/
+.idea/
+*.timestamp-*
+
+# Temp files
+tmp/
+temp/
