@@ -4,7 +4,7 @@ echo   🚀 CodeShare - Startup Script
 echo ==========================================
 
 :: Kill old processes if any
-npx kill-port 4000 3000 2>nul
+call npx kill-port 4000 3000 2>nul
 
 :: Start Backend
 echo [+] Starting Backend Server...

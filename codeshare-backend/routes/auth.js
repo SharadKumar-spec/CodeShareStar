@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const supabase = require('../utils/supabase');
 const { verifyToken } = require('../middleware/auth');
 
 const router = express.Router();
@@ -25,30 +25,41 @@ router.post('/signup', async (req, res) => {
     if (password.length < 6)
       return res.status(400).json({ error: 'Password must be at least 6 characters.' });
 
-    const existing = await User.findOne({ email: email.toLowerCase() });
+    const { data: existing, error: findError } = await supabase
+      .from('users')
+      .select('email')
+      .eq('email', email.toLowerCase())
+      .single();
+
     if (existing)
       return res.status(409).json({ error: 'An account with this email already exists.' });
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const user = await User.create({
-      email: email.toLowerCase().trim(),
-      username: username.trim(),
-      passwordHash,
-      plan: 'FREE',
-      planSelectedAt: null, // null = plan not yet chosen via pricing page
-    });
+    const { data: user, error: insertError } = await supabase
+      .from('users')
+      .insert({
+        email: email.toLowerCase().trim(),
+        username: username.trim(),
+        password_hash: passwordHash,
+        plan: 'FREE',
+        plan_selected_at: null,
+      })
+      .select()
+      .single();
 
-    const token = signToken(user._id);
+    if (insertError) throw insertError;
+
+    const token = signToken(user.id);
 
     res.status(201).json({
       token,
       user: {
-        id: user._id,
+        id: user.id,
         email: user.email,
         username: user.username,
         plan: user.plan,
-        planChosen: !!user.planSelectedAt,
-        codeshareCount: user.codeshareCount,
+        planChosen: !!user.plan_selected_at,
+        codeshareCount: user.codeshare_count,
       },
     });
   } catch (err) {
@@ -64,25 +75,30 @@ router.post('/login', async (req, res) => {
     if (!email || !password)
       return res.status(400).json({ error: 'Email and password are required.' });
 
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const { data: user, error: findError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email.toLowerCase())
+      .single();
+
     if (!user)
       return res.status(401).json({ error: 'Invalid email or password.' });
 
-    const valid = await bcrypt.compare(password, user.passwordHash);
+    const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid)
       return res.status(401).json({ error: 'Invalid email or password.' });
 
-    const token = signToken(user._id);
+    const token = signToken(user.id);
 
     res.json({
       token,
       user: {
-        id: user._id,
+        id: user.id,
         email: user.email,
         username: user.username,
         plan: user.plan,
-        planChosen: !!user.planSelectedAt,
-        codeshareCount: user.codeshareCount,
+        planChosen: !!user.plan_selected_at,
+        codeshareCount: user.codeshare_count,
       },
     });
   } catch (err) {
@@ -92,20 +108,24 @@ router.post('/login', async (req, res) => {
 });
 
 // ── GET /api/auth/me ──────────────────────────────────────────────────────────
-// Used on app load to validate stored JWT and restore session
 router.get('/me', verifyToken, async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('-passwordHash');
+    const { data: user, error: findError } = await supabase
+      .from('users')
+      .select('id, email, username, plan, plan_selected_at, codeshare_count')
+      .eq('id', req.userId)
+      .single();
+
     if (!user) return res.status(404).json({ error: 'User not found.' });
 
     res.json({
       user: {
-        id: user._id,
+        id: user.id,
         email: user.email,
         username: user.username,
         plan: user.plan,
-        planChosen: !!user.planSelectedAt,
-        codeshareCount: user.codeshareCount,
+        planChosen: !!user.plan_selected_at,
+        codeshareCount: user.codeshare_count,
       },
     });
   } catch (err) {
@@ -115,29 +135,30 @@ router.get('/me', verifyToken, async (req, res) => {
 });
 
 // ── PUT /api/auth/plan ────────────────────────────────────────────────────────
-// Called from Pricing Page when user selects a plan
 router.put('/plan', verifyToken, async (req, res) => {
   try {
     const { plan } = req.body;
     if (!['FREE', 'PRO', 'PREMIUM'].includes(plan))
       return res.status(400).json({ error: 'Invalid plan. Must be FREE, PRO, or PREMIUM.' });
 
-    const user = await User.findByIdAndUpdate(
-      req.userId,
-      { plan, planSelectedAt: new Date() },
-      { new: true }
-    );
+    const { data: user, error: updateError } = await supabase
+      .from('users')
+      .update({ plan, plan_selected_at: new Date() })
+      .eq('id', req.userId)
+      .select()
+      .single();
 
+    if (updateError) throw updateError;
     if (!user) return res.status(404).json({ error: 'User not found.' });
 
     res.json({
       user: {
-        id: user._id,
+        id: user.id,
         email: user.email,
         username: user.username,
         plan: user.plan,
         planChosen: true,
-        codeshareCount: user.codeshareCount,
+        codeshareCount: user.codeshare_count,
       },
     });
   } catch (err) {

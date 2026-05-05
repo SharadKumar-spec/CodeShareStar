@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const supabase = require('../utils/supabase');
 
 const PLAN_LIMITS = {
   GUEST: { maxCollaborators: 2, maxCodeshares: 0 },
@@ -35,7 +35,6 @@ function optionalToken(req, res, next) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.userId = decoded.userId;
-    // plan resolved in checkPlanLimits
   } catch {
     req.userId = null;
     req.userPlan = 'GUEST';
@@ -47,13 +46,17 @@ function optionalToken(req, res, next) {
 async function checkPlanLimits(req, res, next) {
   try {
     if (!req.userId) {
-      // guest — allow creating rooms but don't increment counter
       req.userPlan = 'GUEST';
       return next();
     }
 
-    const user = await User.findById(req.userId);
-    if (!user) {
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', req.userId)
+      .single();
+
+    if (!user || error) {
       req.userPlan = 'GUEST';
       return next();
     }
@@ -62,7 +65,7 @@ async function checkPlanLimits(req, res, next) {
     req.dbUser = user;
 
     const limits = PLAN_LIMITS[user.plan];
-    if (limits.maxCodeshares !== Infinity && user.codeshareCount >= limits.maxCodeshares) {
+    if (limits.maxCodeshares !== Infinity && user.codeshare_count >= limits.maxCodeshares) {
       return res.status(403).json({
         error: 'Plan limit reached',
         code: 'CODESHARE_LIMIT',
@@ -75,7 +78,7 @@ async function checkPlanLimits(req, res, next) {
     next();
   } catch (err) {
     console.error('checkPlanLimits error:', err);
-    next(); // fail open — don't block users on DB errors
+    next();
   }
 }
 

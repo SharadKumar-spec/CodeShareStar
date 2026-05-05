@@ -4,7 +4,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { nanoid } = require('nanoid');
-const mongoose = require('mongoose');
+const supabase = require('./utils/supabase');
 
 // ── Routes & Middleware ───────────────────────────────────────────────────────
 const authRouter = require('./routes/auth');
@@ -14,43 +14,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── MongoDB connection with Memory Server Fallback ────────────────────────────
-async function connectDB() {
-  const uri = process.env.MONGO_URI || 'mongodb://localhost:27017/codeshare';
+// ── Supabase Connection Check ────────────────────────────────────────────────
+async function checkSupabase() {
   try {
-    // Try connecting to the provided URI first
-    await mongoose.connect(uri, { serverSelectionTimeoutMS: 5000 });
-    console.log('✅ Connected to MongoDB at', uri);
+    const { data, error } = await supabase.from('users').select('count', { count: 'exact', head: true });
+    if (error) throw error;
+    console.log('✅ Connected to Supabase');
   } catch (err) {
-    console.warn('⚠️ Local MongoDB not found. Starting MongoMemoryServer...');
-    try {
-      const { MongoMemoryServer } = require('mongodb-memory-server');
-      const mongod = await MongoMemoryServer.create();
-      const memoryUri = mongod.getUri();
-      await mongoose.connect(memoryUri);
-      console.log('🚀 MongoMemoryServer started! Data will be lost on restart.');
-      console.log('📍 Connection String:', memoryUri);
-      
-      // Seed a default user for testing in memory mode
-      const User = require('./models/User');
-      const bcrypt = require('bcryptjs');
-      const hash = await bcrypt.hash('password123', 12);
-      await User.create({
-        email: 'sharadgupta6393@gmail.com',
-        username: 'Sharad',
-        passwordHash: hash,
-        plan: 'PREMIUM',
-        planSelectedAt: new Date(),
-        codeshareCount: 5
-      });
-      console.log('✅ Seeded mock user: sharadgupta6393@gmail.com / password123');
-    } catch (memErr) {
-      console.error('❌ Failed to start MongoMemoryServer:', memErr.message);
-    }
+    console.error('❌ Supabase connection error:', err.message);
+    console.warn('⚠️ Make sure your .env has correct SUPABASE_URL and SUPABASE_ANON_KEY');
   }
 }
 
-connectDB();
+checkSupabase();
 
 // ── Auth routes ───────────────────────────────────────────────────────────────
 app.use('/api/auth', authRouter);
@@ -215,7 +191,7 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
-// ── In-memory room store ──────────────────────────────────────────────────────
+// ── In-memory room store (for transient data like users & chat) ───────────────
 const rooms = {};
 
 const USER_COLORS = [
@@ -224,15 +200,29 @@ const USER_COLORS = [
   '#BB8FCE', '#85C1E9',
 ];
 
-function getRoom(roomId) {
+async function getRoom(roomId) {
   if (!rooms[roomId]) {
-    rooms[roomId] = {
-      code: '// Start coding here...\n',
-      language: 'javascript',
-      users: {},
-      chat: [],
-      viewOnlyMode: false,
-    };
+    const { data: dbRoom } = await supabase.from('rooms').select('*').eq('id', roomId).single();
+    if (dbRoom) {
+      rooms[roomId] = {
+        code: dbRoom.code,
+        language: dbRoom.language,
+        users: {},
+        chat: [],
+        viewOnlyMode: dbRoom.view_only_mode,
+        ownerToken: dbRoom.owner_token,
+        ownerId: dbRoom.owner_id,
+      };
+    } else {
+      // Default fallback if not in DB yet (e.g. just created)
+      rooms[roomId] = {
+        code: '// Start coding here...\n',
+        language: 'javascript',
+        users: {},
+        chat: [],
+        viewOnlyMode: false,
+      };
+    }
   }
   return rooms[roomId];
 }
@@ -240,16 +230,42 @@ function getRoom(roomId) {
 // ── REST: Create a room ───────────────────────────────────────────────────────
 app.post('/api/rooms', optionalToken, checkPlanLimits, async (req, res) => {
   const roomId = nanoid(8);
-  const room = getRoom(roomId);
-
   const ownerToken = nanoid(16);
-  room.ownerToken = ownerToken;
-  room.ownerId = req.userId || null;
+  const ownerId = req.userId || null;
 
+  // 1. Create in Supabase
+  const { error: insertError } = await supabase.from('rooms').insert({
+    id: roomId,
+    owner_id: ownerId,
+    owner_token: ownerToken,
+    code: '// Start coding here...\n',
+    language: 'javascript',
+    view_only_mode: false
+  });
+
+  if (insertError) {
+    console.error('Failed to create room in Supabase:', insertError);
+    return res.status(500).json({ error: 'Failed to create room.' });
+  }
+
+  // 2. Initialize in memory
+  rooms[roomId] = {
+    code: '// Start coding here...\n',
+    language: 'javascript',
+    users: {},
+    chat: [],
+    viewOnlyMode: false,
+    ownerToken,
+    ownerId
+  };
+
+  // 3. Increment user's codeshare count if logged in
   if (req.dbUser) {
     try {
-      req.dbUser.codeshareCount += 1;
-      await req.dbUser.save();
+      await supabase
+        .from('users')
+        .update({ codeshare_count: (req.dbUser.codeshare_count || 0) + 1 })
+        .eq('id', req.userId);
     } catch (e) {
       console.warn('Could not increment codeshare count:', e.message);
     }
@@ -259,10 +275,10 @@ app.post('/api/rooms', optionalToken, checkPlanLimits, async (req, res) => {
 });
 
 // ── REST: Get room info ───────────────────────────────────────────────────────
-app.get('/api/rooms/:roomId', (req, res) => {
+app.get('/api/rooms/:roomId', async (req, res) => {
   const { roomId } = req.params;
-  if (rooms[roomId]) {
-    const room = rooms[roomId];
+  const room = await getRoom(roomId);
+  if (room) {
     res.json({
       exists: true,
       userCount: Object.keys(room.users).length,
@@ -279,31 +295,36 @@ app.post('/api/rooms/:roomId/view-only', optionalToken, async (req, res) => {
   const { roomId } = req.params;
   const { enabled, ownerToken } = req.body;
 
-  if (!rooms[roomId]) return res.status(404).json({ error: 'Room not found' });
-  const room = rooms[roomId];
+  const room = await getRoom(roomId);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
 
   if (!req.userId) return res.status(403).json({ error: 'Login required', code: 'AUTH_REQUIRED' });
 
   const isOwner = (ownerToken && room.ownerToken === ownerToken) || (req.userId && room.ownerId === req.userId);
   if (!isOwner) return res.status(403).json({ error: 'Only the room creator can toggle view mode', code: 'NOT_OWNER' });
 
-  const User = require('./models/User');
-  const user = await User.findById(req.userId);
+  // Check plan
+  const { data: user } = await supabase.from('users').select('plan').eq('id', req.userId).single();
   if (!user || !['PRO', 'PREMIUM'].includes(user.plan)) {
     return res.status(403).json({ error: 'PRO or PREMIUM plan required', code: 'PLAN_REQUIRED' });
   }
 
-  rooms[roomId].viewOnlyMode = !!enabled;
-  io.to(roomId).emit('view-only-update', { enabled: rooms[roomId].viewOnlyMode });
-  res.json({ viewOnlyMode: rooms[roomId].viewOnlyMode });
+  room.viewOnlyMode = !!enabled;
+  
+  // Update Supabase
+  await supabase.from('rooms').update({ view_only_mode: room.viewOnlyMode }).eq('id', roomId);
+
+  io.to(roomId).emit('view-only-update', { enabled: room.viewOnlyMode });
+  res.json({ viewOnlyMode: room.viewOnlyMode });
 });
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log(`[+] Socket connected: ${socket.id}`);
 
-  socket.on('join-room', ({ roomId, username, plan = 'GUEST', ownerToken }) => {
-    const room = getRoom(roomId);
+  socket.on('join-room', async ({ roomId, username, plan = 'GUEST', ownerToken }) => {
+    const room = await getRoom(roomId);
+    if (!room) return;
 
     const currentCount = Object.keys(room.users).length;
     const limit = PLAN_LIMITS[plan] || PLAN_LIMITS['GUEST'];
@@ -343,18 +364,26 @@ io.on('connection', (socket) => {
     console.log(`  User "${room.users[socket.id].name}" [${plan}] joined room ${roomId}. Total: ${userList.length}`);
   });
 
-  socket.on('code-change', ({ roomId, code }) => {
+  socket.on('code-change', async ({ roomId, code }) => {
     if (!rooms[roomId]) return;
     if (rooms[roomId].viewOnlyMode && !socket.isOwner) return;
+    
     rooms[roomId].code = code;
     socket.to(roomId).emit('code-update', { code });
+
+    // Persist to Supabase
+    await supabase.from('rooms').update({ code }).eq('id', roomId);
   });
 
-  socket.on('language-change', ({ roomId, language }) => {
+  socket.on('language-change', async ({ roomId, language }) => {
     if (!rooms[roomId]) return;
     if (rooms[roomId].viewOnlyMode && !socket.isOwner) return;
+
     rooms[roomId].language = language;
     io.to(roomId).emit('language-update', { language });
+
+    // Persist to Supabase
+    await supabase.from('rooms').update({ language }).eq('id', roomId);
   });
 
   socket.on('chat-message', ({ roomId, message }) => {
@@ -395,7 +424,7 @@ io.on('connection', (socket) => {
         setTimeout(() => {
           if (rooms[roomId] && Object.keys(rooms[roomId].users).length === 0) {
             delete rooms[roomId];
-            console.log(`  Room ${roomId} cleaned up (empty).`);
+            console.log(`  Room ${roomId} cleaned up (memory only).`);
           }
         }, 10 * 60 * 1000);
       }
@@ -406,5 +435,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
-  console.log(`\n🚀 CodeShare backend running on http://localhost:${PORT}\n`);
+  console.log(`\n🚀 CodeShare backend running on port ${PORT}\n`);
 });

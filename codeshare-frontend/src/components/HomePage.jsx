@@ -93,12 +93,18 @@ export default function HomePage() {
       if (token) headers['Authorization'] = `Bearer ${token}`
 
       const res = await fetch(`${BACKEND_URL}/api/rooms`, { method: 'POST', headers })
-      const { roomId, ownerToken } = await res.json()
-
-      if (res.status === 403) {
-        setShowUpgradeModal(true)
+      
+      if (!res.ok) {
+        if (res.status === 403) {
+          setShowUpgradeModal(true)
+        } else {
+          const data = await res.json()
+          setError(data.error || 'Failed to create room.')
+        }
         return
       }
+
+      const { roomId, ownerToken } = await res.json()
 
       sessionStorage.setItem('cs_username', name)
       if (ownerToken) {
